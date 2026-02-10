@@ -1,0 +1,237 @@
+---  
+
+    - name: Include netbox_getsite
+      include_role:
+        name: netbox_getsite
+        #netbox_site_response
+
+
+
+    - name: Set SNMP location
+      set_fact:
+        SNMP_LOCATION: "{{ netbox_site_response.json.custom_fields.SNMP_LOCATION}}"
+      when:
+        - netbox_site_response.json is defined
+        - netbox_site_response.json | length > 0
+        - netbox_site_response.json.custom_fields is defined
+        - netbox_site_response.json.custom_fields.SNMP_LOCATION is defined # Ensure the 'syslog' custom field exists
+        - netbox_site_response.json.custom_fields.SNMP_LOCATION | length > 0 # Ensure the 'syslog' list is not empty
+        - netbox_site_response.json.custom_fields.SNMP_LOCATION is defined # Ensure the 'ip' key exists in the first element
+
+    - name: Get IPs tagged with snmp_acl_allow from NetBox
+      uri:
+        url: "{{ netbox_url }}/api/ipam/ip-addresses/?tag={{ snmp_acl_tag }}"
+        method: GET
+        headers:
+          Authorization: "Token {{ netbox_token }}"
+          Accept: "application/json"
+        return_content: yes
+      register: netbox_response
+##############
+
+
+
+
+
+    - name: Extract and format ACL lines
+      set_fact:
+        acl_lines: >-
+          {{
+            netbox_response.json.results
+            | map(attribute='address')
+            | map('split', '/')         
+            | map('first')              
+            | zip(range(10, (netbox_response.json.results | length * 10) + 1, 10))
+            | map('reverse')           
+            | map('join', ' permit ')  
+            | list
+          }}
+
+
+
+    - name: Debug formatted ACL lines
+      debug:
+        var: acl_lines
+
+
+    - name: Remove existing ACL (if present)
+      cisco.ios.ios_config:
+        lines:
+          - "no ip access-list standard {{ snmp_acl_name }}"
+      ignore_errors: true
+
+
+    - name: Ensure ACL context exists
+      cisco.ios.ios_config:
+        lines:
+          - "ip access-list standard {{ snmp_acl_name }}"
+        match: line
+
+
+    - name: Add ACEs to ACL one-by-one
+      cisco.ios.ios_config:
+        parents:
+          - "ip access-list standard {{ snmp_acl_name }}"
+        lines: "{{ item }}"
+        match: line         # idempotent: only add if exact line missing
+        replace: line       # if you want sequence updates to replace existing line
+      loop: "{{ acl_lines }}"
+      loop_control:
+        label: "{{ item }}"
+
+
+    # - name: Create/Update ACL for SNMP ({{ snmp_acl_name }})
+    #   cisco.ios.ios_config:
+    #     lines: "{{ acl_lines }}"
+    #     parents: ['ip access-list standard {{ snmp_acl_name }}']
+    #     before:
+    #       - no ip access-list standard {{ snmp_acl_name }}
+    #     match: strict
+    #     replace: block
+
+
+
+    - name: Set SNMP location
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server location {{ SNMP_LOCATION }}
+        before:
+          - no snmp-server location
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RW view
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server view {{ snmp_rw_view }} internet included
+        before:
+          - no snmp-server view {{ snmp_rw_view }} internet included
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RW group
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server group {{ snmp_rw_group }} v3 priv read {{ snmp_rw_view }} write {{ snmp_rw_view }} access {{ snmp_acl_name }}
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RW user
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server user {{ snmp_rw_user }} {{ snmp_rw_group }} v3 auth sha {{ snmp_auth_passphrase_rw }} priv aes 128 {{ snmp_priv_passphrase_rw }} access {{ snmp_acl_name }}
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RW group context
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server group {{ snmp_rw_group }} v3 priv context vlan- match prefix
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RO view
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server view {{ snmp_ro_view }} internet included
+        before:
+          - no snmp-server view {{ snmp_ro_view }} internet included
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RO group
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server group {{ snmp_ro_group }} v3 priv read {{ snmp_ro_view }} access {{ snmp_acl_name }}
+        before:
+          - no snmp-server group {{ snmp_ro_group }} v3 priv
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RO user
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 auth sha {{ snmp_auth_passphrase_ro }} priv aes 128 {{ snmp_priv_passphrase_ro }} access {{ snmp_acl_name }}
+        before:
+          - no snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 auth
+          - no snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 priv
+        match: strict
+        replace: block
+      ignore_errors: true
+
+    - name: Set SNMP RO group context
+      cisco.ios.ios_config:
+        lines:
+          - snmp-server group {{ snmp_ro_group }} v3 priv context vlan- match prefix
+        match: strict
+        replace: block
+      ignore_errors: true
+
+
+
+    - name: Set SNMP for cisco catalyst center
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server view {{ CAT_SNMP_VIEW_NAME }} {{ CAT_SNMP_VIEW_OID }} included"
+          - "snmp-server group {{ CAT_SNMP_GROUP }} v3 priv read {{ CAT_SNMP_VIEW_NAME }} write {{ CAT_SNMP_VIEW_NAME }} access {{ CAT_SNMP_ACCESS_LIST }}"
+          - "snmp-server user {{ CAT_SNMP_USER }} {{ CAT_SNMP_GROUP }} v3 auth {{ CAT_SNMP_AUTH_PROTO }} {{ CAT_SNMP_AUTH_KEY }} priv {{ CAT_SNMP_PRIV_PROTO }} {{ CAT_SNMP_PRIV_BITS }} {{ CAT_SNMP_PRIV_KEY }} access {{ CAT_SNMP_ACCESS_LIST }}"
+          - "snmp-server host {{ CAT_SNMP_HOST }} version 3 priv {{ CAT_SNMP_USER }}"
+        match: strict
+        replace: block
+      ignore_errors: true
+
+
+#############################################################
+
+
+    - name: Get SNMP community config lines
+      cisco.ios.ios_command:
+        commands:
+          - show running-config | include ^snmp-server community
+      register: snmp_config
+
+    - name: cli output
+      debug:
+        msg: "{{snmp_config}}"
+      
+
+
+    - name: Extract SNMP communities with RO/RW (no ACL)
+      set_fact:
+        snmp_communities: >-
+          {{
+            snmp_config.stdout_lines[0]
+            | map('regex_replace', '^snmp-server community (\S+ \S+).*', '\1')
+            | list
+          }}
+
+
+    - name: Debug SNMP community list
+      debug:
+        var: snmp_communities
+
+
+
+    - name: snmpv2 debug output
+      debug:
+        msg: "snmp-server community {{ item }} {{ snmp_acl_name }}"
+      loop: "{{ snmp_communities }}"
+      when: snmp_communities is defined and snmp_communities | length > 0
+
+
+
+    - name: Apply updated SNMP lines one at a time
+      cisco.ios.ios_config:
+        lines:
+          - "snmp-server community {{ item }} {{ snmp_acl_name }}"
+        match: none
+      loop: "{{ snmp_communities }}"
+      when: snmp_communities is defined and snmp_communities | length > 0
+
