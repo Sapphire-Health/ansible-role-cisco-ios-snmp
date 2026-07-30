@@ -1,237 +1,561 @@
----  
 
+ # ------------------------------------------------------------------------
+    # NETBOX: GET SITE (ROLE) + SNMP LOCATION
+    # ------------------------------------------------------------------------
     - name: Include netbox_getsite
       include_role:
         name: netbox_getsite
-        #netbox_site_response
+      # expects netbox_site_response registered inside role
 
-
-
-    - name: Set SNMP location
+    - name: Set SNMP location fact from NetBox custom field
       set_fact:
-        SNMP_LOCATION: "{{ netbox_site_response.json.custom_fields.SNMP_LOCATION}}"
+        SNMP_LOCATION: "{{ netbox_site_response.json.custom_fields.SNMP_LOCATION }}"
       when:
+        - netbox_site_response is defined
         - netbox_site_response.json is defined
         - netbox_site_response.json | length > 0
         - netbox_site_response.json.custom_fields is defined
-        - netbox_site_response.json.custom_fields.SNMP_LOCATION is defined # Ensure the 'syslog' custom field exists
-        - netbox_site_response.json.custom_fields.SNMP_LOCATION | length > 0 # Ensure the 'syslog' list is not empty
-        - netbox_site_response.json.custom_fields.SNMP_LOCATION is defined # Ensure the 'ip' key exists in the first element
+        - netbox_site_response.json.custom_fields.SNMP_LOCATION is defined
+        - netbox_site_response.json.custom_fields.SNMP_LOCATION | length > 0
 
-    - name: Get IPs tagged with snmp_acl_allow from NetBox
+    # ------------------------------------------------------------------------
+    # NETBOX: PULL IPs TAGGED FOR SNMP ACL ALLOW LIST
+    # ------------------------------------------------------------------------
+    - name: Get IPs tagged with SNMP ACL allow tag from NetBox
       uri:
-        url: "{{ netbox_url }}/api/ipam/ip-addresses/?tag={{ snmp_acl_tag }}"
+        url: "{{ netbox_url }}/api/ipam/ip-addresses/?tag={{ ios_snmp.acl.tag }}"
         method: GET
         headers:
           Authorization: "Token {{ netbox_token }}"
           Accept: "application/json"
         return_content: yes
       register: netbox_response
-##############
 
-
-
-
-
-    - name: Extract and format ACL lines
+    - name: Extract and format ACL lines (sequence 10,20,30...)
       set_fact:
         acl_lines: >-
           {{
             netbox_response.json.results
             | map(attribute='address')
-            | map('split', '/')         
-            | map('first')              
+            | map('split', '/')
+            | map('first')
             | zip(range(10, (netbox_response.json.results | length * 10) + 1, 10))
-            | map('reverse')           
-            | map('join', ' permit ')  
+            | map('reverse')
+            | map('join', ' permit ')
             | list
           }}
-
-
 
     - name: Debug formatted ACL lines
       debug:
         var: acl_lines
 
-
+    # ------------------------------------------------------------------------
+    # IOS-XE: BUILD / REPLACE STANDARD ACL
+    # ------------------------------------------------------------------------
     - name: Remove existing ACL (if present)
       cisco.ios.ios_config:
         lines:
-          - "no ip access-list standard {{ snmp_acl_name }}"
+          - "no ip access-list standard {{ ios_snmp.acl.name }}"
       ignore_errors: true
-
 
     - name: Ensure ACL context exists
       cisco.ios.ios_config:
         lines:
-          - "ip access-list standard {{ snmp_acl_name }}"
+          - "ip access-list standard {{ ios_snmp.acl.name }}"
         match: line
-
 
     - name: Add ACEs to ACL one-by-one
       cisco.ios.ios_config:
         parents:
-          - "ip access-list standard {{ snmp_acl_name }}"
+          - "ip access-list standard {{ ios_snmp.acl.name }}"
         lines: "{{ item }}"
-        match: line         # idempotent: only add if exact line missing
-        replace: line       # if you want sequence updates to replace existing line
+        match: line
+        replace: line
       loop: "{{ acl_lines }}"
       loop_control:
         label: "{{ item }}"
 
-
-    # - name: Create/Update ACL for SNMP ({{ snmp_acl_name }})
-    #   cisco.ios.ios_config:
-    #     lines: "{{ acl_lines }}"
-    #     parents: ['ip access-list standard {{ snmp_acl_name }}']
-    #     before:
-    #       - no ip access-list standard {{ snmp_acl_name }}
-    #     match: strict
-    #     replace: block
-
-
-
-    - name: Set SNMP location
+    # ------------------------------------------------------------------------
+    # IOS-XE: SNMP LOCATION (FROM NETBOX)
+    # ------------------------------------------------------------------------
+    - name: Configure SNMP location
       cisco.ios.ios_config:
         lines:
-          - snmp-server location {{ SNMP_LOCATION }}
+          - "snmp-server location {{ SNMP_LOCATION }}"
         before:
-          - no snmp-server location
+          - "no snmp-server location"
         match: strict
         replace: block
+      when: SNMP_LOCATION is defined and SNMP_LOCATION | length > 0
       ignore_errors: true
 
-    - name: Set SNMP RW view
+    # ------------------------------------------------------------------------
+    # IOS-XE: SNMPv3 VIEWS
+    # ------------------------------------------------------------------------
+    - name: Configure SNMP views (RO/RW)
       cisco.ios.ios_config:
         lines:
-          - snmp-server view {{ snmp_rw_view }} internet included
-        before:
-          - no snmp-server view {{ snmp_rw_view }} internet included
-        match: strict
-        replace: block
-      ignore_errors: true
+          - "snmp-server view {{ item.value }} internet included"
+        match: line
+      loop: "{{ ios_snmp.views | dict2items }}"
+      loop_control:
+        label: "{{ item.key }} => {{ item.value }}"
 
-    - name: Set SNMP RW group
+    # ------------------------------------------------------------------------
+    # IOS-XE: SNMPv3 GROUPS (RO + RW)
+    #   RO group: read ro-view
+    #   RW group: read ro-view + write rw-view
+    # ------------------------------------------------------------------------
+    - name: Configure SNMP groups (RO / RW)
       cisco.ios.ios_config:
         lines:
-          - snmp-server group {{ snmp_rw_group }} v3 priv read {{ snmp_rw_view }} write {{ snmp_rw_view }} access {{ snmp_acl_name }}
+          - >-
+            snmp-server group {{ ios_snmp.groups[item] }} v3 priv
+            read {{ ios_snmp.views.ro }}
+            {% if item == 'rw' %}write {{ ios_snmp.views.rw }}{% endif %}
+            access {{ ios_snmp.acl.name }}
         match: strict
         replace: block
-      ignore_errors: true
+      loop:
+        - ro
+        - rw
+      loop_control:
+        label: "{{ item }}"
 
-    - name: Set SNMP RW user
+    - name: Configure SNMP group context (vlan- match prefix)
       cisco.ios.ios_config:
         lines:
-          - snmp-server user {{ snmp_rw_user }} {{ snmp_rw_group }} v3 auth sha {{ snmp_auth_passphrase_rw }} priv aes 128 {{ snmp_priv_passphrase_rw }} access {{ snmp_acl_name }}
+          - "snmp-server group {{ ios_snmp.groups[item] }} v3 priv context {{ ios_snmp.group_context.prefix }} match prefix"
         match: strict
         replace: block
-      ignore_errors: true
+      loop:
+        - ro
+        - rw
+      when:
+        - ios_snmp.group_context is defined
+        - ios_snmp.group_context.enabled | bool
+        - ios_snmp.group_context.prefix is defined
+        - ios_snmp.group_context.prefix | length > 0
 
-    - name: Set SNMP RW group context
+    # ------------------------------------------------------------------------
+    # SNMPv3 USERS + HOSTS (robust delete/recreate) + OPTIONAL CLEANUP
+    # Uses:
+    #   ios_snmp.users
+    #   ios_snmp.groups
+    #   ios_snmp.acl.name
+    #   ios_snmp_cleanup (bool)
+    # ------------------------------------------------------------------------
+
+    - name: Get existing SNMPv3 user lines from running-config (for safe deletes)
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | include ^snmp-server user "
+      register: snmp_users_raw
+
+
+    - name: Build map of existing SNMPv3 user -> full config line (robust)
+      set_fact:
+        existing_snmp_user_lines: "{{ snmp_users_raw.stdout_lines[0] | default([]) }}"
+        existing_snmp_user_map: >-
+          {%- set d = {} -%}
+          {%- for l in (snmp_users_raw.stdout_lines[0] | default([])) -%}
+          {%- set parts = l.split() -%}
+          {%- if parts | length > 2 and parts[0] == 'snmp-server' and parts[1] == 'user' -%}
+          {%- set _ = d.update({ parts[2]: l }) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ d }}
+
+
+    - name: Remove SNMPv3 users we intend to manage (delete exact existing line if present)
       cisco.ios.ios_config:
         lines:
-          - snmp-server group {{ snmp_rw_group }} v3 priv context vlan- match prefix
-        match: strict
-        replace: block
+          - "no {{ existing_snmp_user_map[item.username] }}"
+        match: none
+      loop: "{{ ios_snmp.users }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when:
+        - existing_snmp_user_map is defined
+        - item.username in existing_snmp_user_map
       ignore_errors: true
 
-    - name: Set SNMP RO view
+    - name: Configure SNMPv3 users from ios_snmp.users (create/update)
       cisco.ios.ios_config:
         lines:
-          - snmp-server view {{ snmp_ro_view }} internet included
-        before:
-          - no snmp-server view {{ snmp_ro_view }} internet included
-        match: strict
-        replace: block
-      ignore_errors: true
+          - >-
+            snmp-server user {{ item.username }}
+            {{ ios_snmp.groups[item.access] }}
+            v3 auth {{ item.auth_proto }} {{ item.auth_pass }}
+            priv {{ item.priv_proto }} {{ item.priv_bits }} {{ item.priv_pass }}
+            access {{ ios_snmp.acl.name }}
+        match: none
+      loop: "{{ ios_snmp.users }}"
+      loop_control:
+        label: "{{ item.username }} ({{ item.access }})"
 
-    - name: Set SNMP RO group
+    - name: Get existing SNMP host lines from running-config (for cleanup/replace)
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | include ^snmp-server host "
+      register: snmp_hosts_raw
+
+    - name: Build list of desired SNMP host lines (from users with host defined)
+      set_fact:
+        desired_snmp_host_lines: >-
+          {{
+            ios_snmp.users
+            | selectattr('host', 'defined')
+            | selectattr('host', 'string')
+            | map('regex_replace', '^(.*)$', '') | list
+          }}
+      vars:
+        # (We build via Jinja below; this dummy var keeps ansible happy with the set_fact structure.)
+        _dummy: ""
+
+    - name: Build desired SNMP host lines (actual)
+      set_fact:
+        desired_snmp_host_lines: >-
+          {%- set lines = [] -%}
+          {%- for u in ios_snmp.users -%}
+          {%- if u.host is defined and (u.host|string|length) > 0 -%}
+          {%- set _ = lines.append('snmp-server host ' ~ (u.host|string) ~ ' version 3 priv ' ~ u.username) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ lines }}
+
+    - name: Remove existing SNMP host lines for users we manage (so changes apply cleanly)
       cisco.ios.ios_config:
-        lines:
-          - snmp-server group {{ snmp_ro_group }} v3 priv read {{ snmp_ro_view }} access {{ snmp_acl_name }}
-        before:
-          - no snmp-server group {{ snmp_ro_group }} v3 priv
-        match: strict
-        replace: block
+        lines: >-
+          {{
+            (snmp_hosts_raw.stdout_lines[0] | default([]))
+            | select('regex_search', ' version 3 \\S+ (' ~ ((ios_snmp.users | map(attribute="username") | list) | join("|")) ~ ')\\b$')
+            | map('regex_replace', '^(.*)$', 'no \\1')
+            | list
+          }}
+        match: none
+      when:
+        - snmp_hosts_raw is defined
+        - (snmp_hosts_raw.stdout_lines[0] | default([])) | length > 0
       ignore_errors: true
 
-    - name: Set SNMP RO user
+    - name: Configure SNMP hosts for users that define 'host'
       cisco.ios.ios_config:
-        lines:
-          - snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 auth sha {{ snmp_auth_passphrase_ro }} priv aes 128 {{ snmp_priv_passphrase_ro }} access {{ snmp_acl_name }}
-        before:
-          - no snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 auth
-          - no snmp-server user {{ snmp_ro_user }} {{ snmp_ro_group }} v3 priv
-        match: strict
-        replace: block
-      ignore_errors: true
+        lines: "{{ desired_snmp_host_lines }}"
+        match: none
+      when: desired_snmp_host_lines | length > 0
 
-    - name: Set SNMP RO group context
-      cisco.ios.ios_config:
-        lines:
-          - snmp-server group {{ snmp_ro_group }} v3 priv context vlan- match prefix
-        match: strict
-        replace: block
-      ignore_errors: true
-
-
-
-    - name: Set SNMP for cisco catalyst center
-      cisco.ios.ios_config:
-        lines:
-          - "snmp-server view {{ CAT_SNMP_VIEW_NAME }} {{ CAT_SNMP_VIEW_OID }} included"
-          - "snmp-server group {{ CAT_SNMP_GROUP }} v3 priv read {{ CAT_SNMP_VIEW_NAME }} write {{ CAT_SNMP_VIEW_NAME }} access {{ CAT_SNMP_ACCESS_LIST }}"
-          - "snmp-server user {{ CAT_SNMP_USER }} {{ CAT_SNMP_GROUP }} v3 auth {{ CAT_SNMP_AUTH_PROTO }} {{ CAT_SNMP_AUTH_KEY }} priv {{ CAT_SNMP_PRIV_PROTO }} {{ CAT_SNMP_PRIV_BITS }} {{ CAT_SNMP_PRIV_KEY }} access {{ CAT_SNMP_ACCESS_LIST }}"
-          - "snmp-server host {{ CAT_SNMP_HOST }} version 3 priv {{ CAT_SNMP_USER }}"
-        match: strict
-        replace: block
-      ignore_errors: true
-
-
-#############################################################
-
-
+  
+    # ------------------------------------------------------------------------
+    # SNMPv2 COMMUNITY ACL RETROFIT (KEEP YOUR LOGIC, JUST SWAP ACL NAME)
+    # ------------------------------------------------------------------------
     - name: Get SNMP community config lines
       cisco.ios.ios_command:
         commands:
-          - show running-config | include ^snmp-server community
+          - "show running-config | include ^snmp-server community"
       register: snmp_config
 
-    - name: cli output
-      debug:
-        msg: "{{snmp_config}}"
-      
 
 
     - name: Extract SNMP communities with RO/RW (no ACL)
       set_fact:
         snmp_communities: >-
           {{
-            snmp_config.stdout_lines[0]
-            | map('regex_replace', '^snmp-server community (\S+ \S+).*', '\1')
+            snmp_config.stdout_lines[0] | default([])
+            | select('match', '^snmp-server community \\S+ (RO|RW)(\\s|$)')
+            | map('regex_replace', '^snmp-server community (\\S+ (RO|RW)).*', '\\1')
             | list
           }}
+
 
 
     - name: Debug SNMP community list
       debug:
         var: snmp_communities
 
-
-
-    - name: snmpv2 debug output
-      debug:
-        msg: "snmp-server community {{ item }} {{ snmp_acl_name }}"
-      loop: "{{ snmp_communities }}"
-      when: snmp_communities is defined and snmp_communities | length > 0
-
-
-
-    - name: Apply updated SNMP lines one at a time
+    - name: Apply updated SNMP community lines (add ACL) one at a time
       cisco.ios.ios_config:
         lines:
-          - "snmp-server community {{ item }} {{ snmp_acl_name }}"
+          - "snmp-server community {{ item }} {{ ios_snmp.acl.name }}"
         match: none
       loop: "{{ snmp_communities }}"
       when: snmp_communities is defined and snmp_communities | length > 0
 
+
+
+###############################################################
+#      snmp v3 user cleanup                                   #
+#                                                             #   
+###############################################################
+
+
+
+
+    - name: Cleanup | Skip message if ios_snmp_cleanup is false
+      debug:
+        msg: "ios_snmp_cleanup is false - skipping SNMP cleanup"
+      when: not (ios_snmp_cleanup | default(false) | bool)
+
+    # ------------------------------------------------------------
+    # Gather existing SNMP config lines (authoritative source: show run)
+    # ------------------------------------------------------------
+    - name: Cleanup | Gather existing SNMP user and host lines from running-config
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | include ^snmp-server user "
+          - "show running-config | include ^snmp-server host "
+      register: snmp_cfg_raw
+      when: ios_snmp_cleanup | default(false) | bool
+
+    - name: Cleanup | Normalize existing lines into lists
+      set_fact:
+        existing_snmp_user_lines: "{{ snmp_cfg_raw.stdout_lines[0] | default([]) }}"
+        existing_snmp_host_lines: "{{ snmp_cfg_raw.stdout_lines[1] | default([]) }}"
+      when: ios_snmp_cleanup | default(false) | bool
+
+    # ------------------------------------------------------------
+    # Build desired/existing username lists
+    # ------------------------------------------------------------
+    - name: Cleanup | Build desired SNMP username list (from vars)
+      set_fact:
+        desired_snmp_usernames: "{{ ios_snmp.users | map(attribute='username') | list }}"
+      when: ios_snmp_cleanup | default(false) | bool
+
+    - name: Cleanup | Build existing SNMP username list (parse from config lines)
+      set_fact:
+        existing_snmp_usernames: >-
+          {{
+            existing_snmp_user_lines
+            | map('regex_replace', '^snmp-server user\\s+(\\S+).*', '\\1')
+            | list
+            | unique
+          }}
+      when: ios_snmp_cleanup | default(false) | bool
+
+    - name: Cleanup | Compute SNMP users to remove (usernames only)
+      set_fact:
+        snmp_users_to_remove: >-
+          {{
+            (existing_snmp_usernames | difference(desired_snmp_usernames))
+            | difference(ios_snmp_protected_users | default(['admin']))
+          }}
+      when: ios_snmp_cleanup | default(false) | bool
+
+    - name: Cleanup | DEBUG lists (sanity check)
+      debug:
+        msg:
+          - "Desired SNMP users: {{ desired_snmp_usernames }}"
+          - "Existing SNMP users: {{ existing_snmp_usernames }}"
+          - "Protected users: {{ ios_snmp_protected_users | default(['admin']) }}"
+          - "SNMP users to remove: {{ snmp_users_to_remove }}"
+      when: ios_snmp_cleanup | default(false) | bool
+
+    # ------------------------------------------------------------
+    # Build exact NO commands from the running-config lines
+    # 1) Remove host lines referencing removed users (first)
+    # 2) Remove user lines for removed users (second)
+    # ------------------------------------------------------------
+    - name: Cleanup | Build removal commands (hosts first, then users)
+      set_fact:
+        snmp_host_remove_lines: >-
+          {{
+            existing_snmp_host_lines
+            | select('search', '\\b(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+            | map('regex_replace', '^(.*)$', 'no \\1')
+            | list
+          }}
+        snmp_user_remove_lines: >-
+          {{
+            existing_snmp_user_lines
+            | select('match', '^snmp-server user\\s+(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+            | map('regex_replace', '^(.*)$', 'no \\1')
+            | list
+          }}
+      when:
+        - ios_snmp_cleanup | default(false) | bool
+        - snmp_users_to_remove is defined
+        - snmp_users_to_remove | length > 0
+
+    - name: Cleanup | DEBUG removal commands
+      debug:
+        msg:
+          - "Host removal lines: {{ snmp_host_remove_lines | default([]) }}"
+          - "User removal lines: {{ snmp_user_remove_lines | default([]) }}"
+      when:
+        - ios_snmp_cleanup | default(false) | bool
+        - snmp_users_to_remove is defined
+        - snmp_users_to_remove | length > 0
+
+    # ------------------------------------------------------------
+    # Apply removals
+    # ------------------------------------------------------------
+    - name: Cleanup | Remove SNMP host lines referencing removed users
+      cisco.ios.ios_config:
+        lines: "{{ snmp_host_remove_lines }}"
+        match: none
+      when:
+        - ios_snmp_cleanup | default(false) | bool
+        - snmp_host_remove_lines is defined
+        - snmp_host_remove_lines | length > 0
+
+    - name: Cleanup | Remove SNMP user lines for removed users
+      cisco.ios.ios_config:
+        lines: "{{ snmp_user_remove_lines }}"
+        match: none
+      when:
+        - ios_snmp_cleanup | default(false) | bool
+        - snmp_user_remove_lines is defined
+        - snmp_user_remove_lines | length > 0
+
+    # ------------------------------------------------------------
+    # Verify (fail if still present)
+    # ------------------------------------------------------------
+    - name: Cleanup | Verify removed users are absent from running-config
+      cisco.ios.ios_command:
+        commands:
+          - "show running-config | include ^snmp-server user "
+          - "show running-config | include ^snmp-server host "
+      register: snmp_verify
+      when: ios_snmp_cleanup | default(false) | bool
+
+    - name: Cleanup | Fail if any removed user still exists in config
+      fail:
+        msg: >-
+          SNMP cleanup failed. Some users still appear in running-config:
+          Users to remove: {{ snmp_users_to_remove }}
+          Matching snmp-server user lines:
+          {{
+            (snmp_verify.stdout_lines[0] | default([]))
+            | select('search', '\\b(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+            | list
+          }}
+          Matching snmp-server host lines:
+          {{
+            (snmp_verify.stdout_lines[1] | default([]))
+            | select('search', '\\b(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+            | list
+          }}
+      when:
+        - ios_snmp_cleanup | default(false) | bool
+        - snmp_users_to_remove is defined
+        - snmp_users_to_remove | length > 0
+        - >
+          (
+            (
+              (snmp_verify.stdout_lines[0] | default([]))
+              | select('search', '\\b(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+              | list
+              | length
+            ) > 0
+          )
+          or
+          (
+            (
+              (snmp_verify.stdout_lines[1] | default([]))
+              | select('search', '\\b(' ~ (snmp_users_to_remove | join('|')) ~ ')\\b')
+              | list
+              | length
+            ) > 0
+          )
+
+    - name: Cleanup | Success message
+      debug:
+        msg: "SNMP cleanup complete. Removed users: {{ snmp_users_to_remove | default([]) }}"
+      when: ios_snmp_cleanup | default(false) | bool
+
+
+
+
+    - name: Display device under test
+      debug:
+        msg: "Testing SNMPv3 against {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+
+
+
+    - name: Ensure snmpwalk output directory exists
+      delegate_to: localhost
+      file:
+        path: snmpwalk
+        state: directory
+        mode: '0755'
+
+
+    - name: Test SNMPv3 users
+      delegate_to: localhost
+      vars:
+        ios_snmp_target: "{{ item.host | default(ansible_host | default(inventory_hostname)) }}"
+      ansible.builtin.command: >
+        snmpwalk
+        -v3
+        -l authPriv
+        -u {{ item.username }}
+        -a {{ item.auth_proto | upper }}
+        -A {{ item.auth_pass }}
+        -x {{ item.priv_proto | upper }}
+        {% if item.priv_bits is defined %}
+        -X {{ item.priv_pass }}
+        {% else %}
+        -X {{ item.priv_pass }}
+        {% endif %}
+        {{ ios_snmp_target }}
+        {{ ios_snmp_oid_test }}
+      register: ios_snmp_test
+      changed_when: false
+      failed_when:
+        - ios_snmp_test.rc != 0
+      loop: "{{ ios_snmp.users }}"
+      loop_control:
+        label: "{{ item.username }}"
+
+    - name: Report SNMPv3 test results
+      delegate_to: localhost
+      debug:
+        msg: |
+          ✅ SNMPv3 SUCCESS
+          User : {{ item.item.username }}
+          Host : {{ item.item.host | default(ansible_host | default(inventory_hostname)) }}
+          OID  : {{ ios_snmp_oid_test }}
+      loop: "{{ ios_snmp_test.results }}"
+      when: item.rc == 0
+
+
+    - name: Append SNMPv3 test command and results to file
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: snmpwalk/snmpwalk.txt
+        create: yes
+        insertafter: EOF
+        line: |
+          ----
+          Device: {{ inventory_hostname }}
+          Target: {{ item.item.host | default(ansible_host | default(inventory_hostname)) }}
+          User: {{ item.item.username }}
+          Command:
+          snmpwalk -v3 -l authPriv -u {{ item.item.username }} -a {{ item.item.auth_proto | upper }} -A {{ item.item.auth_pass }} -x {{ item.item.priv_proto | upper }} -X {{ item.item.priv_pass }} {{ item.item.host | default(ansible_host | default(inventory_hostname)) }} {{ ios_snmp_oid_test }}
+          Result (rc={{ item.rc }}):
+          {{ item.stdout | default(item.stderr) }}
+      loop: "{{ ios_snmp_test.results }}"
+
+
+
+    - name: Log device to success.txt if ALL SNMP tests passed
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: snmpwalk/success.txt
+        create: yes
+        insertafter: EOF
+        line: "{{ inventory_hostname }} "
+      when:
+        - ios_snmp_test.results | selectattr('rc', 'ne', 0) | list | length == 0
+
+
+
+    - name: Log device to failure.txt if ANY SNMP test failed
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: snmpwalk/failure.txt
+        create: yes
+        insertafter: EOF
+        line: "{{ inventory_hostname }} "
+      when:
+        - ios_snmp_test.results | selectattr('rc', 'ne', 0) | list | length > 0
