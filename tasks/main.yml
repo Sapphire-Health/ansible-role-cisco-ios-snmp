@@ -56,6 +56,10 @@
       debug:
         var: ios_snmp.acl.name
 
+    - name: Print command 
+      debug:
+        msg: "no ip access-list standard {{ ios_snmp.acl.name }}"
+
     - name: Remove existing ACL (if present)    
       cisco.ios.ios_config:
         lines:
