@@ -52,19 +52,18 @@
     # ------------------------------------------------------------------------
     # IOS-XE: BUILD / REPLACE STANDARD ACL
     # ------------------------------------------------------------------------
-    - name: Remove existing ACL (if present)
-      diff_against: none
+    - name: Remove existing ACL (if present)    
       cisco.ios.ios_config:
         lines:
           - "no ip access-list standard {{ ios_snmp.acl.name }}"
+        match: none
       ignore_errors: true
 
-    - name: Ensure ACL context exists
-      diff_against: none
+    - name: Ensure ACL context exists      
       cisco.ios.ios_config:
         lines:
           - "ip access-list standard {{ ios_snmp.acl.name }}"
-        match: line
+        match: none 
 
     - name: Add ACEs to ACL one-by-one
       cisco.ios.ios_config:
