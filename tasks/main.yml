@@ -241,6 +241,7 @@
             status_code: 200
           register: ise_snmp_ip_check
           delegate_to: localhost
+          connection: local
 
         - name: Set ISE device-found flag
           set_fact:
@@ -259,6 +260,7 @@
             status_code: 200
           register: ise_snmp_device_details
           delegate_to: localhost
+          connection: local
           when: ise_snmp_device_found
 
         - name: Build updated SNMP settings for Cisco ISE
@@ -295,6 +297,7 @@
             status_code: [200, 201]
           register: ise_snmp_put_result
           delegate_to: localhost
+          connection: local
           ignore_errors: true
           when: ise_snmp_device_found
 
@@ -303,6 +306,7 @@
             content: "{{ ise_snmp_put_result | to_nice_json }}"
             dest: "{{ playbook_dir }}/logs/ise_snmp_put_{{ inventory_hostname }}.json"
           delegate_to: localhost
+          connection: local
           when:
             - ise_snmp_device_found
             - ise_snmp_put_result is failed
