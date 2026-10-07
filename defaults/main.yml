@@ -2,7 +2,7 @@
 netbox_url: "https://netbox.example.com"
 netbox_token: "your_token_here"
 netbox_validate_certs: false
-
+Version: 1.0
 
 # snmp_rw_view: "RWview"
 # snmp_rw_group: "RWgroup"

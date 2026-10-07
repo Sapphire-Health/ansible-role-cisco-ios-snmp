@@ -1,4 +1,8 @@
 
+    - name: Show ios_snmp role version
+      debug:
+        msg: "ios_snmp role version {{ Version }}"
+
  # ------------------------------------------------------------------------
     # NETBOX: GET SITE (ROLE) + SNMP LOCATION
     # ------------------------------------------------------------------------
